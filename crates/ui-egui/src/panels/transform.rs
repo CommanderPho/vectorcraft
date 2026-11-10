@@ -16,6 +16,100 @@ use crate::theme::Tokens;
 use crate::widgets::{self, menu_item};
 use crate::{VectorcraftApp, icons};
 
+// ─── Copy Geometry ────────────────────────────────────────────────────────────
+//
+// Coordinate and unit conventions
+// ────────────────────────────────
+// All four values use **exactly the same coordinate space the Transform panel displays**:
+//
+//   • X, Y — the selected reference point on the page in the document's General unit, with
+//     the ruler origin subtracted (same as the panel's X/Y fields).
+//   • W, H — the oriented bounding-box width and height in the General unit (same as the
+//     panel's W/H fields; for a rotated object this is the object's own frame, not the
+//     axis-aligned screen bounding box).
+//
+// All four values are in the **document's General unit** (points, inches, mm, …); the JSON
+// numbers represent that unit.  A value that is not finite is replaced with 0 (NaN / ±Inf
+// must never appear in the output).  Negative zero is normalised to positive zero.
+
+/// Serialise the four geometry values that the Transform panel already shows into the compact
+/// JSON format the clipboard carries.  `x`, `y`, `w`, `h` are all in the document's current
+/// General unit, as the panel's fields display them (ruler-origin-adjusted X/Y, oriented W/H).
+///
+/// Key order is fixed: `x`, `y`, `width`, `height`.
+///
+/// # Numeric contract
+/// * Every value is a JSON number (never a string, never null).
+/// * Decimal point regardless of locale — `serde_json` always writes it.
+/// * No thousands separators — `serde_json` never writes them.
+/// * Precision: up to 15 significant digits as Rust's `f64` Display produces; trailing
+///   zeros are present only where the float representation requires them.
+/// * NaN and ±Infinity are replaced with `0.0` (the inputs come from panel values that
+///   are already finite, but we guard defensively).
+/// * Negative zero is normalised to `0.0`.
+pub(crate) fn copy_geometry_json(x: f64, y: f64, w: f64, h: f64) -> String {
+    // Guard: map non-finite to 0, normalise −0.
+    let clean = |v: f64| -> f64 {
+        if !v.is_finite() {
+            0.0
+        } else if v == 0.0 {
+            0.0 // collapses -0.0
+        } else {
+            v
+        }
+    };
+    let (x, y, w, h) = (clean(x), clean(y), clean(w), clean(h));
+    // Build a compact JSON object with a guaranteed key order.
+    // `serde_json::json!` produces object keys in source order, which satisfies the spec.
+    // `to_string` always uses a decimal point and never emits thousands separators.
+    let v = json!({ "x": x, "y": y, "width": w, "height": h });
+    v.to_string()
+}
+
+/// Draw a geometry field (`num_field_named` / `size_field_named`) and attach a "Copy Geometry"
+/// right-click menu to its area.
+///
+/// `field_value` is the value the field shows (already in the current unit, nil when no
+/// selection).  `all` is `Some((x, y, w, h))` — the four panel values in the current unit —
+/// when the selection is valid; `None` disables the menu item.
+///
+/// Returns whatever `draw_field` returns (`Option<f64>` for a committed edit).
+///
+/// # Why use `ui.interact` on the pre-allocated rect
+/// `num_field_named` / `size_field_named` do not expose the egui `Response` they create
+/// internally.  Allocating a hover-only response over the same rect after the field is
+/// drawn lets us attach `.context_menu` without touching the numeric widget internals.
+pub(crate) fn geom_field_named<R>(
+    ui: &mut Ui,
+    id: impl std::hash::Hash + Copy + std::fmt::Debug,
+    all: Option<(f64, f64, f64, f64)>,
+    draw_field: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    // Record cursor before the field so we can reconstruct its rect for the context menu.
+    let before = ui.next_widget_position();
+    let result = draw_field(ui);
+    // The context-menu response must cover the field but not block mouse interaction with it.
+    // We use `Sense::hover()` (no click, no drag) over a rect that matches the field's actual
+    // allocation so any field events still fire normally.  `min_rect` grew by exactly the field
+    // since `before` — if the grid gave a wider cell we use that; otherwise 80 pt is the hard-
+    // coded field width used throughout this panel.
+    let after_x = ui.next_widget_position().x;
+    let row_h = ui.spacing().interact_size.y;
+    let width = if after_x > before.x { after_x - before.x } else { 80.0 };
+    let field_rect = egui::Rect::from_min_size(before, egui::vec2(width, row_h));
+    let resp = ui.interact(field_rect, ui.scope_id().with((id, "copy-geom-ctx")), egui::Sense::hover());
+    let has = all.is_some();
+    resp.context_menu(|ui| {
+        if menu_item(ui, tl!("Copy Geometry"), has, false) {
+            if let Some((x, y, w, h)) = all {
+                let json_text = copy_geometry_json(x, y, w, h);
+                ui.ctx().copy_text(json_text);
+            }
+        }
+    });
+    result
+}
+
 pub const ANGLE_PRESETS: [f64; 9] = [-180.0, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0];
 /// The shear angle's presets: steep enough to be useful, short of the degenerate ±90°.
 pub const SHEAR_PRESETS: [f64; 9] = [-60.0, -45.0, -30.0, -15.0, 0.0, 15.0, 30.0, 45.0, 60.0];
@@ -281,22 +375,41 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         }
         ui.add_space(4.0);
         ui.add_enabled_ui(has, |ui| {
+            // Pre-compute the four panel values for the Copy Geometry context menu on each field.
+            // All four values are in the document's current General unit (same as the fields show).
+            // The menu is disabled (passes `None`) when there is no valid selection.
+            let copy_geom_xywh: Option<(f64, f64, f64, f64)> = rp.zip(bounds).map(|(r, b)| {
+                (
+                    units.from_pt(r.x - origin.x),
+                    units.from_pt(r.y - origin.y),
+                    units.from_pt(b.width()),
+                    units.from_pt(b.height()),
+                )
+            });
             egui::Grid::new("xfp-grid").num_columns(4).spacing([4.0, 6.0]).min_col_width(0.0).show(ui, |ui| {
                 widgets::dim_label(ui, "X:");
-                if let Some(v) = widgets::num_field_named(ui, "xfp-x", Some(crate::i18n::t("X:")), rp.map(|p| p.x - origin.x), units, 80.0) {
+                if let Some(v) = geom_field_named(ui, "xfp-x", copy_geom_xywh, |ui| {
+                    widgets::num_field_named(ui, "xfp-x", Some(crate::i18n::t("X:")), rp.map(|p| p.x - origin.x), units, 80.0)
+                }) {
                     run_transform(app, "object.setBounds", json!({"x": to_box(v + origin.x, 0.0).0, "reference": refi, "copy": copy}));
                 }
                 widgets::dim_label(ui, "W:");
-                if let Some(v) = widgets::size_field_named(ui, "xfp-w", Some(tl!("W:")), bounds.map(|b| b.width()), units, 80.0) {
+                if let Some(v) = geom_field_named(ui, "xfp-w", copy_geom_xywh, |ui| {
+                    widgets::size_field_named(ui, "xfp-w", Some(tl!("W:")), bounds.map(|b| b.width()), units, 80.0)
+                }) {
                     run_transform(app, "object.setBounds", json!({"width": v, "reference": refi, "proportional": link, "copy": copy}));
                 }
                 ui.end_row();
                 widgets::dim_label(ui, "Y:");
-                if let Some(v) = widgets::num_field_named(ui, "xfp-y", Some(crate::i18n::t("Y:")), rp.map(|p| p.y - origin.y), units, 80.0) {
+                if let Some(v) = geom_field_named(ui, "xfp-y", copy_geom_xywh, |ui| {
+                    widgets::num_field_named(ui, "xfp-y", Some(crate::i18n::t("Y:")), rp.map(|p| p.y - origin.y), units, 80.0)
+                }) {
                     run_transform(app, "object.setBounds", json!({"y": to_box(0.0, v + origin.y).1, "reference": refi, "copy": copy}));
                 }
                 widgets::dim_label(ui, "H:");
-                if let Some(v) = widgets::size_field_named(ui, "xfp-h", Some(tl!("H:")), bounds.map(|b| b.height()), units, 80.0) {
+                if let Some(v) = geom_field_named(ui, "xfp-h", copy_geom_xywh, |ui| {
+                    widgets::size_field_named(ui, "xfp-h", Some(tl!("H:")), bounds.map(|b| b.height()), units, 80.0)
+                }) {
                     run_transform(app, "object.setBounds", json!({"height": v, "reference": refi, "proportional": link, "copy": copy}));
                 }
                 ui.end_row();

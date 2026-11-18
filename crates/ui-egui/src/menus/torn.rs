@@ -219,6 +219,54 @@ mod tests {
     }
 
     #[test]
+    fn grip_double_click_tears_a_popup_menu_off() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), crate::Services::default());
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        theme::apply(&ctx, Default::default());
+        let tree = menu_tree();
+        let (_, view) = tree.iter().find(|(t, _)| *t == "View").unwrap();
+        let host = MenuHost::Popup { path: vec!["View".into()] };
+        let id = egui::Id::unique("test-tear-grip-dbl");
+        let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0));
+        // Frames 50 ms apart, so two clicks a frame apart make a double-click.
+        let mut time = 0.0;
+        let mut run = |events: Vec<egui::Event>| {
+            time += 0.05;
+            let input = egui::RawInput { screen_rect: Some(screen), events, time: Some(time), ..Default::default() };
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::Area::new(id).fixed_pos(pos2(100.0, 50.0)).show(ui.ctx(), |ui| {
+                    egui::containers::menu::menu_style(ui.style_mut());
+                    menu_body(&app, ui, view, &mut None, &host);
+                });
+            });
+            out.textures_delta.clear();
+        };
+        run(vec![]);
+        run(vec![]);
+        let rect = ctx.memory(|m| m.area_rect(id)).expect("menu area");
+        let grip = pos2(rect.center().x, rect.top() + 6.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: grip,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        run(vec![egui::Event::PointerMoved(grip), button(true)]);
+        run(vec![button(false)]);
+        // First click already tears (same as a single click); clear and tear again via a second
+        // click that egui reports as a double-click.
+        let _ = take_tear_request(&ctx);
+        run(vec![button(true)]);
+        run(vec![button(false)]);
+        let (torn_path, pos) = take_tear_request(&ctx).expect("grip double-click tears the menu off");
+        assert_eq!(torn_path, ["View"]);
+        assert!(pos[0].is_finite() && pos[1].is_finite());
+        upsert_torn(&mut app, torn_path, pos);
+        assert_eq!(app.ui.torn_menus.len(), 1);
+    }
+
+    #[test]
     fn close_box_removes_a_torn_menu() {
         let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), crate::Services::default());
         upsert_torn(&mut app, vec!["View".into()], [100.0, 50.0]);

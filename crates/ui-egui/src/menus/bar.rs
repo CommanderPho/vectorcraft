@@ -205,7 +205,8 @@ const GRIP_H: f32 = 12.0;
 /// Side of the × on a torn-off menu's grip.
 const CLOSE: f32 = 14.0;
 
-/// Dotted handle at the top of a menu: click tears a popup off; on a torn host, drag moves and × closes.
+/// Dotted handle at the top of a menu: click or double-click tears a popup off; on a torn host, drag
+/// moves and × closes.
 fn menu_grip(ui: &mut egui::Ui, host: &MenuHost) {
     let t = Tokens::get(ui.ctx());
     let w = ui.available_width().max(1.0);
@@ -214,9 +215,11 @@ fn menu_grip(ui: &mut egui::Ui, host: &MenuHost) {
         MenuHost::Popup { path } => {
             let resp = ui.interact(bar, ui.scope_id().with("menu-tear"), Sense::click());
             paint_dots(ui, bar, t.text_disabled);
-            let tip = tl!("Click to tear off");
+            let tip = tl!("Double-click to tear off");
             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tip));
-            if resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(tip).clicked() {
+            let resp = resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(tip);
+            // Single click still tears (same as before); double-click is the advertised easy gesture.
+            if resp.clicked() || resp.double_clicked() {
                 let origin = ui.min_rect().min;
                 ui.ctx().data_mut(|d| d.insert_temp(tear_request_id(), (path.clone(), [origin.x, origin.y])));
                 ui.close();

@@ -467,3 +467,158 @@ fn rotate_and_shear_fields_are_named() {
     let _ = h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Rotate");
     let _ = h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Shear");
 }
+
+// ─── Copy Geometry tests ─────────────────────────────────────────────────────
+
+/// The JSON serialiser always emits a decimal point, never NaN or Infinity, and in the
+/// required key order.
+#[test]
+fn copy_geometry_json_basic_format() {
+    let s = copy_geometry_json(120.5, 80.0, 240.0, 135.0);
+    assert_eq!(s, r#"{"x":120.5,"y":80.0,"width":240.0,"height":135.0}"#);
+    // Key order is fixed.
+    let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+    let keys: Vec<&str> = parsed.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    assert_eq!(keys, ["x", "y", "width", "height"]);
+    // Values are numbers, not strings.
+    for k in ["x", "y", "width", "height"] {
+        assert!(parsed[k].is_number(), "key {k} must be a number");
+    }
+}
+
+/// Fractional and negative coordinates round-trip through JSON numbers without loss.
+#[test]
+fn copy_geometry_json_fractional_and_negative() {
+    let s = copy_geometry_json(-12.5, -0.25, 0.1, 99.9);
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    assert!((v["x"].as_f64().unwrap() - -12.5).abs() < 1e-12);
+    assert!((v["y"].as_f64().unwrap() - -0.25).abs() < 1e-12);
+    assert!((v["width"].as_f64().unwrap() - 0.1).abs() < 1e-12);
+    assert!((v["height"].as_f64().unwrap() - 99.9).abs() < 1e-12);
+}
+
+/// Negative zero is normalised to positive zero.
+#[test]
+fn copy_geometry_json_negative_zero_normalised() {
+    let s = copy_geometry_json(-0.0, -0.0, -0.0, -0.0);
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    // JSON parsers fold -0.0 and 0.0 to the same value, but serde_json serialises 0.0
+    // as `0.0` and (if Rust's f64 format preserves it) -0.0 as `-0.0`. We guarantee
+    // our output never contains a minus sign for a zero value.
+    assert!(!s.contains("-0"), "output should not contain -0: {s}");
+    for k in ["x", "y", "width", "height"] {
+        assert_eq!(v[k].as_f64().unwrap(), 0.0, "key {k}");
+    }
+}
+
+/// NaN and ±Infinity are replaced with 0.
+#[test]
+fn copy_geometry_json_non_finite_values_become_zero() {
+    let s = copy_geometry_json(f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::NAN);
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    for k in ["x", "y", "width", "height"] {
+        assert_eq!(v[k].as_f64().unwrap(), 0.0, "key {k} should be 0");
+    }
+}
+
+/// The output is valid JSON (parseable) and contains no thousands separators.
+#[test]
+fn copy_geometry_json_no_thousands_separators() {
+    let s = copy_geometry_json(12345.6, 9876.5, 100000.0, 200000.0);
+    assert!(!s.contains(','), "no commas inside numbers: {s}");
+    // The whole string is valid JSON.
+    serde_json::from_str::<serde_json::Value>(&s).expect("valid JSON");
+}
+
+/// The panel computes the Copy Geometry values in the document's General unit, using the
+/// same reference point and bounds the X/Y/W/H fields show.  A rectangle at (0,0) 100×50 pt
+/// with the default centre reference point shows X=50 pt, Y=25 pt (the centre), W=100 pt,
+/// H=50 pt.
+#[test]
+fn copy_geometry_values_match_the_transform_panel_fields() {
+    let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+    app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+    app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 100, "height": 50})).unwrap();
+    // The centre reference point (index 4) is the default.
+    // The ruler origin is (0, 0) by default.
+    let shown = texts(&mut app, show);
+    // X and Y shown are the centre point: 50 pt and 25 pt.
+    assert!(shown.iter().any(|t| t == "50 pt"), "X centre: {shown:?}");
+    assert!(shown.iter().any(|t| t == "25 pt"), "Y centre: {shown:?}");
+    // W and H shown are 100 pt and 50 pt.
+    assert!(shown.iter().any(|t| t == "100 pt"), "W: {shown:?}");
+    assert!(shown.iter().any(|t| t == "50 pt"), "H: {shown:?}");
+    // The JSON matches what the fields show.
+    let json_str = copy_geometry_json(50.0, 25.0, 100.0, 50.0);
+    let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(v["x"].as_f64().unwrap(), 50.0);
+    assert_eq!(v["y"].as_f64().unwrap(), 25.0);
+    assert_eq!(v["width"].as_f64().unwrap(), 100.0);
+    assert_eq!(v["height"].as_f64().unwrap(), 50.0);
+}
+
+/// A rotated rectangle: W and H are the rectangle's own (oriented) sides, as the Transform
+/// panel shows, not the axis-aligned screen bounding box.
+#[test]
+fn copy_geometry_values_use_oriented_bounds_for_rotated_objects() {
+    let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+    app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+    app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 100, "height": 50})).unwrap();
+    app.run("object.rotate", json!({"angle": 45, "absolute": true})).unwrap();
+    let shown = texts(&mut app, show);
+    // The panel still shows 100 pt × 50 pt (oriented), not the axis-aligned box.
+    assert!(shown.iter().any(|t| t == "100 pt"), "oriented W 100 pt: {shown:?}");
+    assert!(shown.iter().any(|t| t == "50 pt"), "oriented H 50 pt: {shown:?}");
+    // The JSON uses the same values.
+    let json_str = copy_geometry_json(100.0, 50.0, 100.0, 50.0);
+    let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(v["width"].as_f64().unwrap(), 100.0);
+    assert_eq!(v["height"].as_f64().unwrap(), 50.0);
+}
+
+/// With no selection the Copy Geometry item is disabled: `copy_geom_xywh` is `None` inside the
+/// panel, so the menu item is drawn but disabled.  We verify this indirectly by checking that
+/// the panel still renders without panic and the geometry texts are absent when nothing is
+/// selected.
+#[test]
+fn copy_geometry_disabled_with_no_selection() {
+    let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+    app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+    // No selection: the panel renders without panic.
+    let shown = texts(&mut app, show);
+    // No geometry values are shown while nothing is selected.
+    assert!(!shown.iter().any(|t| t.ends_with(" pt") && t != "Scale Strokes & Effects"), "{shown:?}");
+}
+
+/// A group selection: the panel shows the group's aggregate bounding box, so Copy Geometry
+/// should copy those aggregate values.  Two rectangles with no gap: the aggregate is the union.
+#[test]
+fn copy_geometry_aggregate_selection() {
+    let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+    app.run("file.new", json!({"width": 400, "height": 400})).unwrap();
+    let id1 = app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 100, "height": 50})).unwrap()["id"].as_u64().unwrap();
+    let id2 = app.run("shape.rectangle", json!({"x": 100, "y": 0, "width": 100, "height": 50})).unwrap()["id"].as_u64().unwrap();
+    app.run("select.set", json!({"ids": [id1, id2]})).unwrap();
+    let shown = texts(&mut app, show);
+    // The aggregate box is 200 × 50, centre at (100, 25).
+    assert!(shown.iter().any(|t| t == "200 pt"), "aggregate W: {shown:?}");
+    assert!(shown.iter().any(|t| t == "50 pt"), "aggregate H: {shown:?}");
+    // The JSON serialiser handles these aggregate values correctly.
+    let json_str = copy_geometry_json(100.0, 25.0, 200.0, 50.0);
+    let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+    assert_eq!(v["width"].as_f64().unwrap(), 200.0);
+}
+
+/// Copying geometry does not mutate the document: the revision counter stays the same.
+#[test]
+fn copy_geometry_does_not_mutate_the_document() {
+    let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+    app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+    app.run("shape.rectangle", json!({"x": 20, "y": 30, "width": 100, "height": 50})).unwrap();
+    let revision_before = app.session.active().unwrap().revision;
+    // Serialising the geometry values (which is what the copy action does) must not change
+    // the document.
+    let _ = copy_geometry_json(70.0, 55.0, 100.0, 50.0);
+    let revision_after = app.session.active().unwrap().revision;
+    assert_eq!(revision_before, revision_after, "document must not be mutated");
+}

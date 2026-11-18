@@ -818,7 +818,9 @@ fn menus_are_as_wide_as_their_items() {
         let mut out = ctx.run_ui(input, |ui| {
             egui::Area::new(id).show(ui.ctx(), |ui| {
                 egui::containers::menu::menu_style(ui.style_mut());
-                ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| menu_body(&app, ui, file, &mut None));
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                    menu_body(&app, ui, file, &mut None, &MenuHost::Transient);
+                });
             });
         });
         out.textures_delta.clear();
@@ -844,7 +846,9 @@ fn long_menus_scroll_inside_a_short_window() {
             let mut out = ctx.run_ui(input, |ui| {
                 egui::Area::new(id).fixed_pos(egui::pos2(300.0, 30.0)).show(ui.ctx(), |ui| {
                     egui::containers::menu::menu_style(ui.style_mut());
-                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| menu_body(&app, ui, window, &mut None));
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                        menu_body(&app, ui, window, &mut None, &MenuHost::Transient);
+                    });
                 });
             });
             out.textures_delta.clear();
@@ -879,7 +883,9 @@ fn unlock_all_and_show_all_clicked_with_shift_alt_act_within_the_group() {
         let mut out = ctx.run_ui(input, |ui| {
             egui::Area::new(id).fixed_pos(egui::pos2(0.0, 0.0)).show(ui.ctx(), |ui| {
                 egui::containers::menu::menu_style(ui.style_mut());
-                ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| menu_body(&app, ui, object, &mut clicked));
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                    menu_body(&app, ui, object, &mut clicked, &MenuHost::Transient);
+                });
             });
         });
         out.textures_delta.clear();

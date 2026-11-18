@@ -1,4 +1,4 @@
-use super::bar::render_items;
+use super::bar::{MenuHost, render_items};
 use super::state::enabled;
 use super::tree::{arrange_items, transform_items};
 use super::{Item, Sep, Value, VectorcraftApp, c, cp, json, sub, widgets};
@@ -168,7 +168,7 @@ pub fn context_menu_body(app: &VectorcraftApp, ui: &mut egui::Ui, clicked: &mut 
     widgets::menu_scroll(ui, |ui| {
         ui.set_min_width(200.0);
         // Its toggles already say what they do (Show Rulers, Hide Guides): no check-mark gutter.
-        render_items(app, ui, &context_items(app), false, clicked);
+        render_items(app, ui, &context_items(app), false, clicked, &MenuHost::Transient);
     });
 }
 
@@ -183,6 +183,6 @@ pub fn ruler_unit_items() -> Vec<Item> {
 pub fn ruler_menu_body(app: &VectorcraftApp, ui: &mut egui::Ui, clicked: &mut Option<(String, Value)>) {
     widgets::menu_scroll(ui, |ui| {
         ui.set_min_width(160.0);
-        render_items(app, ui, &ruler_unit_items(), true, clicked);
+        render_items(app, ui, &ruler_unit_items(), true, clicked, &MenuHost::Transient);
     });
 }

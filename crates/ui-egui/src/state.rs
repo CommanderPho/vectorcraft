@@ -504,6 +504,9 @@ pub struct UiState {
     /// Tool flyouts torn off the toolbar into floating panels.
     #[serde(default)]
     pub floating_flyouts: Vec<FloatingFlyout>,
+    /// Application menus torn off the in-window menu bar into floating panels. Session-only.
+    #[serde(skip)]
+    pub torn_menus: Vec<TornMenu>,
     /// The Basic and Advanced toolbars as Edit Toolbar left them (none: as they ship).
     #[serde(default)]
     pub toolbar_edits: ToolbarEdits,
@@ -940,6 +943,15 @@ pub struct FloatingFlyout {
     pub pos: [f32; 2],
 }
 
+/// An in-window application menu torn off into a floating panel until its × closes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TornMenu {
+    /// English tree keys, e.g. `["View"]` or `["Object", "Arrange"]`.
+    pub path: Vec<String>,
+    /// Top-left corner in screen points.
+    pub pos: [f32; 2],
+}
+
 impl FloatingFlyout {
     /// Keep strips of known tools, one per group (a hand-edited preferences file).
     pub fn sanitize(strips: &mut Vec<FloatingFlyout>) {
@@ -1208,6 +1220,7 @@ impl Default for UiState {
             link_statuses: Default::default(),
             slot_tool: Default::default(),
             floating_flyouts: vec![],
+            torn_menus: vec![],
             toolbar_edits: ToolbarEdits::default(),
             toolbar_show: ToolbarShow::default(),
             tools_drawer: false,

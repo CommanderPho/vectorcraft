@@ -2,6 +2,61 @@ use super::entries::{Row, entry, shown_shortcut};
 use super::invoke::{field_event, focused_text_field, invoke, to_field, with_held_keys};
 use super::tree::menu_tree_named;
 use super::{Entry, Item, Tokens, Value, VectorcraftApp, widgets};
+use crate::state::TornMenu;
+use egui::{Sense, Stroke, pos2, vec2};
+
+/// How an application or context menu is hosted this frame.
+#[derive(Clone)]
+pub(super) enum MenuHost {
+    /// Context / ruler popup: no tear grip; item clicks dismiss.
+    Transient,
+    /// In-window menu-bar popup: dotted grip tears the menu off.
+    Popup {
+        /// English tree keys for this menu (e.g. `["View"]` or `["Object", "Arrange"]`).
+        path: Vec<String>,
+    },
+    /// Already torn-off floating host: grip moves it, × closes it; item clicks stay open.
+    Torn {
+        /// Drag response id (shared across frames so a drag continues).
+        drag_id: egui::Id,
+    },
+}
+
+impl MenuHost {
+    fn keep_open(&self) -> bool {
+        matches!(self, Self::Torn { .. })
+    }
+}
+
+/// egui temp key for a popup grip click: `(path, top-left)`.
+fn tear_request_id() -> egui::Id {
+    egui::Id::unique("menu-tear-request")
+}
+
+/// Take a pending tear request written by a popup grip click this frame.
+pub(super) fn take_tear_request(ctx: &egui::Context) -> Option<(Vec<String>, [f32; 2])> {
+    let id = tear_request_id();
+    let v = ctx.data(|d| d.get_temp::<(Vec<String>, [f32; 2])>(id));
+    if v.is_some() {
+        ctx.data_mut(|d| d.remove::<(Vec<String>, [f32; 2])>(id));
+    }
+    v
+}
+
+/// egui temp key for a torn menu's × click: the area id that should close.
+fn torn_close_id() -> egui::Id {
+    egui::Id::unique("menu-torn-close")
+}
+
+/// Whether the torn menu with `drag_id`'s area asked to close this frame.
+pub(super) fn take_torn_close(ctx: &egui::Context, drag_id: egui::Id) -> bool {
+    let id = torn_close_id();
+    let closed = ctx.data(|d| d.get_temp::<egui::Id>(id));
+    if closed.is_some() {
+        ctx.data_mut(|d| d.remove::<egui::Id>(id));
+    }
+    closed == Some(drag_id)
+}
 
 /// Render the menu bar.
 /// The in-window menu bar. Returns where its titles end (x): the bar itself takes the full width.
@@ -38,7 +93,8 @@ pub fn menu_bar(app: &mut VectorcraftApp, ui: &mut egui::Ui) -> f32 {
                 let text = egui::RichText::new(tl!(title)).size(13.0).color(t.text);
                 let resp = ui.add(egui::Button::new(text));
                 crate::palette::note_spot(ui, resp.rect, || crate::palette::SpotAt::Menu((*title).to_string()));
-                egui::Popup::menu(&resp).show(|ui| menu_body(app, ui, items, &mut clicked));
+                let host = MenuHost::Popup { path: vec![(*title).to_string()] };
+                egui::Popup::menu(&resp).show(|ui| menu_body(app, ui, items, &mut clicked, &host));
                 if *title == "File" {
                     file_open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
                 }
@@ -58,6 +114,10 @@ pub fn menu_bar(app: &mut VectorcraftApp, ui: &mut egui::Ui) -> f32 {
     // while one is, or the menu would open under them.
     ctx.data_mut(|d| d.insert_temp(menu_open_id(), open));
 
+    if let Some((path, pos)) = take_tear_request(&ctx) {
+        upsert_torn(app, path, pos);
+    }
+
     let field = ctx.data(|d| d.get_temp::<Field>(field_key));
     if !open && focused_text_field(&ctx).is_none() {
         ctx.data_mut(|d| d.remove::<Field>(field_key));
@@ -72,6 +132,15 @@ pub fn menu_bar(app: &mut VectorcraftApp, ui: &mut egui::Ui) -> f32 {
         }
     }
     end
+}
+
+/// Remember a torn-off menu at `pos`, replacing an earlier tear of the same path.
+pub(super) fn upsert_torn(app: &mut VectorcraftApp, path: Vec<String>, pos: [f32; 2]) {
+    if let Some(m) = app.ui.torn_menus.iter_mut().find(|m| m.path == path) {
+        m.pos = pos;
+    } else {
+        app.ui.torn_menus.push(TornMenu { path, pos });
+    }
 }
 
 /// Where the menu bar keeps whether one of its top-level menus is open.
@@ -116,34 +185,134 @@ fn switch_on_hover(ctx: &egui::Context, titles: &[egui::Response]) -> bool {
 
 /// A top-level menu's popup: as wide as its widest item (label plus shortcut), at least 230 pt;
 /// it scrolls when it is taller than the window.
-pub(super) fn menu_body(app: &VectorcraftApp, ui: &mut egui::Ui, items: &[Item], clicked: &mut Option<(String, Value)>) {
+pub(super) fn menu_body(
+    app: &VectorcraftApp,
+    ui: &mut egui::Ui,
+    items: &[Item],
+    clicked: &mut Option<(String, Value)>,
+    host: &MenuHost,
+) {
     widgets::menu_scroll(ui, |ui| {
         widgets::menu_min_width(ui, 230.0);
-        render_items(app, ui, items, true, clicked);
+        render_menu(app, ui, items, true, clicked, host);
     });
+}
+
+/// Grip (and items) for an application or context menu under `host`.
+pub(super) fn render_menu(
+    app: &VectorcraftApp,
+    ui: &mut egui::Ui,
+    items: &[Item],
+    checks: bool,
+    clicked: &mut Option<(String, Value)>,
+    host: &MenuHost,
+) {
+    if !matches!(host, MenuHost::Transient) {
+        menu_grip(ui, host);
+    }
+    render_items(app, ui, items, checks, clicked, host);
+}
+
+/// Height of the dotted tear-off / move grip at the top of an application menu.
+const GRIP_H: f32 = 12.0;
+/// Side of the × on a torn-off menu's grip.
+const CLOSE: f32 = 14.0;
+
+/// Dotted handle at the top of a menu: click or double-click tears a popup off; on a torn host, drag
+/// moves and × closes.
+fn menu_grip(ui: &mut egui::Ui, host: &MenuHost) {
+    let t = Tokens::get(ui.ctx());
+    let w = ui.available_width().max(1.0);
+    let (bar, _) = ui.allocate_exact_size(vec2(w, GRIP_H), Sense::hover());
+    match host {
+        MenuHost::Popup { path } => {
+            let resp = ui.interact(bar, ui.scope_id().with("menu-tear"), Sense::click());
+            paint_dots(ui, bar, t.text_disabled);
+            let tip = tl!("Double-click to tear off");
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tip));
+            let resp = resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(tip);
+            // Single click still tears (same as before); double-click is the advertised easy gesture.
+            if resp.clicked() || resp.double_clicked() {
+                let origin = ui.min_rect().min;
+                ui.ctx().data_mut(|d| d.insert_temp(tear_request_id(), (path.clone(), [origin.x, origin.y])));
+                ui.close();
+            }
+        }
+        MenuHost::Torn { drag_id } => {
+            let x = egui::Rect::from_min_size(bar.right_top() - vec2(CLOSE, 0.0), vec2(CLOSE, GRIP_H));
+            let grip = egui::Rect::from_min_max(bar.min, egui::pos2(x.left(), bar.bottom()));
+            let xr = ui.interact(x, drag_id.with("close"), Sense::click());
+            crate::icons::paint(ui, "x", x.shrink2(vec2(1.0, 0.0)), if xr.hovered() { t.text_strong } else { t.text });
+            let close_tip = tl!("Close");
+            xr.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), close_tip));
+            if xr.on_hover_text(close_tip).clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp(torn_close_id(), *drag_id));
+            }
+            let resp = ui.interact(grip, *drag_id, Sense::DRAG);
+            paint_dots(ui, grip, t.text_disabled);
+            let tip = tl!("Drag to move");
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tip));
+            if resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else {
+                resp.on_hover_cursor(egui::CursorIcon::Grab).on_hover_text(tip);
+            }
+        }
+        MenuHost::Transient => {}
+    }
+}
+
+fn paint_dots(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
+    let cx = rect.center().x;
+    for k in 0..3 {
+        let y = rect.center().y - 2.0 + k as f32 * 2.0;
+        ui.painter().line_segment([pos2(cx - 9.0, y), pos2(cx + 9.0, y)], Stroke::new(0.6, color));
+    }
 }
 
 /// `items` as menu buttons; with `checks`, items that can be on or off show a check mark (or the
 /// room for one).
-pub(super) fn render_items(app: &VectorcraftApp, ui: &mut egui::Ui, items: &[Item], checks: bool, clicked: &mut Option<(String, Value)>) {
+pub(super) fn render_items(
+    app: &VectorcraftApp,
+    ui: &mut egui::Ui,
+    items: &[Item],
+    checks: bool,
+    clicked: &mut Option<(String, Value)>,
+    host: &MenuHost,
+) {
     let t = Tokens::get(ui.ctx());
-    for e in items.iter().filter_map(|it| entry(app, it)) {
-        match e {
-            Entry::Sep => {
-                ui.separator();
-            }
-            Entry::Header(h) => {
-                ui.label(egui::RichText::new(h).size(11.0).color(t.text_dim));
-            }
-            Entry::Sub(label, children) => {
+    let keep_open = host.keep_open();
+    for it in items {
+        let Some(e) = entry(app, it) else { continue };
+        match (it, e) {
+            (Item::Sub(key, children), Entry::Sub(label, _)) => {
+                let child = match host {
+                    MenuHost::Popup { path } => {
+                        let mut p = path.clone();
+                        p.push((*key).to_string());
+                        MenuHost::Popup { path: p }
+                    }
+                    // Nested popups from a torn menu or context menu are not tearable.
+                    MenuHost::Torn { .. } | MenuHost::Transient => MenuHost::Transient,
+                };
                 ui.menu_button(label, |ui| {
                     widgets::menu_scroll(ui, |ui| {
                         widgets::menu_min_width(ui, 200.0);
-                        render_items(app, ui, children, checks || shows_marks(app, children), clicked);
+                        if !matches!(child, MenuHost::Transient) {
+                            menu_grip(ui, &child);
+                        }
+                        render_items(app, ui, children, checks || shows_marks(app, children), clicked, &child);
                     });
                 });
             }
-            Entry::Item(row) => render_row(app, ui, &row, checks, clicked),
+            (_, Entry::Sep) => {
+                ui.separator();
+            }
+            (_, Entry::Header(h)) => {
+                ui.label(egui::RichText::new(h).size(11.0).color(t.text_dim));
+            }
+            (_, Entry::Item(row)) => render_row(app, ui, &row, checks, clicked, keep_open),
+            (_, Entry::Sub(..)) => {}
         }
     }
 }
@@ -163,7 +332,7 @@ fn only_toggles(app: &VectorcraftApp, items: &[Item]) -> bool {
 
 /// One menu item: its label (with a check mark, or the room for one, under `checks`), its shortcut,
 /// and Type › Font's samples.
-fn render_row(app: &VectorcraftApp, ui: &mut egui::Ui, row: &Row, checks: bool, clicked: &mut Option<(String, Value)>) {
+fn render_row(app: &VectorcraftApp, ui: &mut egui::Ui, row: &Row, checks: bool, clicked: &mut Option<(String, Value)>, keep_open: bool) {
     let sc = row.shortcut.map(shown_shortcut).unwrap_or_default();
     let Some((id, p)) = row.command else {
         ui.add_enabled_ui(false, |ui| {
@@ -198,7 +367,9 @@ fn render_row(app: &VectorcraftApp, ui: &mut egui::Ui, row: &Row, checks: bool, 
     };
     if r.clicked() {
         *clicked = row.target().map(|target| with_held_keys(target, ui.input(|i| i.modifiers)));
-        ui.close();
+        if !keep_open {
+            ui.close();
+        }
     }
 }
 
@@ -221,4 +392,17 @@ pub(crate) fn home_key(app: &VectorcraftApp) -> (Option<u64>, usize) {
 /// an app with no document shows an empty window, and the Home button still opens the screen.
 pub(crate) fn home_showing(app: &VectorcraftApp) -> bool {
     app.ui.home.is_some() || (app.session.active().is_none() && app.session.prefs.show_home_screen)
+}
+
+/// The items at `path` in the in-window menu tree (`["View"]`, `["Object", "Arrange"]`, …).
+pub(super) fn items_at<'a>(tree: &'a [(&str, Vec<Item>)], path: &[String]) -> Option<&'a [Item]> {
+    let (first, rest) = path.split_first()?;
+    let mut items: &[Item] = tree.iter().find(|(t, _)| *t == first.as_str()).map(|(_, i)| i.as_slice())?;
+    for key in rest {
+        items = items.iter().find_map(|it| match it {
+            Item::Sub(l, ch) if *l == key.as_str() => Some(ch.as_slice()),
+            _ => None,
+        })?;
+    }
+    Some(items)
 }

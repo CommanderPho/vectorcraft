@@ -51,6 +51,7 @@ mod run;
 mod slots;
 mod state;
 mod submenus;
+mod torn;
 mod tree;
 mod ui_commands;
 
@@ -58,8 +59,9 @@ pub use bar::menu_bar;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use bar::menu_open;
 pub(crate) use bar::{home_key, home_showing};
+pub use torn::show as show_torn;
 #[cfg(test)]
-use bar::{menu_body, pointer_reaches_title};
+use bar::{MenuHost, menu_body, pointer_reaches_title};
 pub use context::{context_items, context_menu_body, ruler_menu_body, ruler_unit_items};
 #[cfg(test)]
 use entries::flatten;

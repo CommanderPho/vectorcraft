@@ -1,10 +1,12 @@
 #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))]
 use super::portal_save;
-#[cfg(target_os = "linux")]
-use super::tablet;
+#[cfg(windows)]
+use super::windows_screen_color;
 #[cfg(all(windows, not(target_vendor = "win7")))]
 use super::windows_stylus;
 use super::{ClipboardProbeFactory, FilePick, PickRequest, Services, clipboard, cursor_theme, fileio, printing};
+#[cfg(target_os = "linux")]
+use super::{linux_screen_color, tablet};
 #[cfg(target_os = "macos")]
 use super::{mac_save_format, mac_screen_color, mac_tablet};
 
@@ -71,7 +73,7 @@ fn open_extensions(exts: &[impl AsRef<str>], any_case: bool) -> Vec<String> {
 /// `d` set up for `request`: its title, file types, folder and suggested name.
 fn dialog_for<D: DialogSettings>(d: D, request: &PickRequest) -> D {
     let pick = match request {
-        PickRequest::Open(pick) | PickRequest::Save(pick) => pick,
+        PickRequest::Open(pick) | PickRequest::Save(pick) | PickRequest::OpenFiles(pick) => pick,
         PickRequest::OpenMany => {
             return fileio::place_filters().fold(d.title(vectorcraft_ui_egui::i18n::t("Place")), |d, (name, exts)| {
                 d.filter(
@@ -81,8 +83,9 @@ fn dialog_for<D: DialogSettings>(d: D, request: &PickRequest) -> D {
             });
         }
         PickRequest::Folder => return d,
+        PickRequest::FolderAt(folder) => return d.folder(folder),
     };
-    let any_case = CASE_SENSITIVE_FILTERS && matches!(request, PickRequest::Open(_));
+    let any_case = CASE_SENSITIVE_FILTERS && matches!(request, PickRequest::Open(_) | PickRequest::OpenFiles(_));
     let d = pick.filters.iter().fold(d, |d, (name, exts)| {
         d.filter(
             vectorcraft_ui_egui::i18n::tr_ctx(vectorcraft_ui_egui::i18n::current(), "file-filter", name.as_str()),
@@ -93,7 +96,55 @@ fn dialog_for<D: DialogSettings>(d: D, request: &PickRequest) -> D {
         Some(folder) => d.folder(folder),
         None => d,
     };
-    if pick.name.is_empty() { d } else { d.file_name(&pick.name) }
+    if pick.name.is_empty() {
+        return d;
+    }
+    // Windows' save dialog changes the extension when a different file type is chosen only when
+    // the suggested name has no explicit extension. rfd supplies the first filter's extension to
+    // that dialog, so leave the suffix to Windows for saves that offer several formats (#5451).
+    // A remaining dot in the stem would look like another explicit extension to Windows.
+    #[cfg(windows)]
+    if matches!(request, PickRequest::Save(_))
+        && pick.filters.len() > 1
+        && let Some(ext) = std::path::Path::new(&pick.name).extension().and_then(|e| e.to_str())
+        && pick.filters.iter().any(|(_, exts)| exts.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+        && let Some(stem) = std::path::Path::new(&pick.name).file_stem().and_then(|s| s.to_str())
+        && !stem.contains('.')
+    {
+        return d.file_name(stem);
+    }
+    d.file_name(&pick.name)
+}
+
+#[cfg(test)]
+#[test]
+fn a_folder_picker_asked_for_a_folder_starts_there() {
+    /// The settings a dialog was given, by name.
+    #[derive(Default)]
+    struct Recorded(Vec<String>);
+    impl DialogSettings for Recorded {
+        fn parent(self, _: &winit::window::Window) -> Self {
+            self
+        }
+        fn title(mut self, title: &str) -> Self {
+            self.0.push(format!("title {title}"));
+            self
+        }
+        fn filter(mut self, name: &str, _: &[impl ToString]) -> Self {
+            self.0.push(format!("filter {name}"));
+            self
+        }
+        fn folder(mut self, folder: &str) -> Self {
+            self.0.push(format!("folder {folder}"));
+            self
+        }
+        fn file_name(mut self, name: &str) -> Self {
+            self.0.push(format!("name {name}"));
+            self
+        }
+    }
+    assert_eq!(dialog_for(Recorded::default(), &PickRequest::FolderAt("/a/b".into())).0, ["folder /a/b"]);
+    assert!(dialog_for(Recorded::default(), &PickRequest::Folder).0.is_empty());
 }
 
 /// A native file dialog for `request` over `parent` (on Linux the portal then shows it over the
@@ -120,7 +171,6 @@ fn make_folder(request: &PickRequest) {
 #[cfg(not(target_os = "macos"))]
 #[cfg_attr(windows, allow(unused_variables))]
 fn show_dialog(dialog: rfd::FileDialog, request: &PickRequest, parent: &Parent) -> Vec<String> {
-    make_folder(request);
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))]
     if let PickRequest::Save(pick) = request
         && let Some(answer) = portal_save::pick(pick, parent.as_deref())
@@ -129,9 +179,9 @@ fn show_dialog(dialog: rfd::FileDialog, request: &PickRequest, parent: &Parent) 
     }
     let paths = match request {
         PickRequest::Open(_) => dialog.pick_file().into_iter().collect(),
-        PickRequest::OpenMany => dialog.pick_files().unwrap_or_default(),
+        PickRequest::OpenMany | PickRequest::OpenFiles(_) => dialog.pick_files().unwrap_or_default(),
         PickRequest::Save(_) => dialog.save_file().into_iter().collect(),
-        PickRequest::Folder => dialog.pick_folder().into_iter().collect(),
+        PickRequest::Folder | PickRequest::FolderAt(_) => dialog.pick_folder().into_iter().collect(),
     };
     paths.into_iter().map(|p| p.to_string_lossy().to_string()).collect()
 }
@@ -139,7 +189,30 @@ fn show_dialog(dialog: rfd::FileDialog, request: &PickRequest, parent: &Parent) 
 /// Show the dialog for `request` over `parent` now → the paths picked.
 #[cfg(not(target_os = "macos"))]
 fn pick_now(request: PickRequest, parent: &Parent) -> Vec<String> {
-    show_dialog(file_dialog(&request, parent), &request, parent)
+    let beacon = &vectorcraft_ui_egui::hang_beacon::BEACON;
+    marked_dialog(beacon, || make_folder(&request), || show_dialog(file_dialog(&request, parent), &request, parent))
+}
+
+/// Run `prepare` (making the dialog's folder), then `show`, marked on `beacon` as a dialog: the
+/// dialog waits for the user and is not a stall for the hang report (`hang_watch`), while `prepare`
+/// is still timed.
+#[cfg(not(target_os = "macos"))]
+fn marked_dialog<T>(beacon: &vectorcraft_ui_egui::hang_beacon::Beacon, prepare: impl FnOnce(), show: impl FnOnce() -> T) -> T {
+    prepare();
+    let _mark = beacon.activity(vectorcraft_ui_egui::hang_beacon::Activity::Dialog);
+    show()
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+#[test]
+fn making_a_dialogs_folder_is_timed_and_the_dialog_is_not() {
+    use vectorcraft_ui_egui::hang_beacon::{Activity, Beacon};
+    let beacon = Beacon::new();
+    let mut preparing = None;
+    let showing = marked_dialog(&beacon, || preparing = Some(beacon.sample().activity), || beacon.sample().activity);
+    assert_eq!(preparing, Some(Activity::None), "making the folder is timed");
+    assert_eq!(showing, Activity::Dialog, "the dialog is not");
+    assert_eq!(beacon.sample().activity, Activity::None, "the mark ends with the dialog");
 }
 
 /// macOS shows no dialog in line: its modal loop would run inside winit's event handler, and an
@@ -214,22 +287,9 @@ fn read_file_head(path: &str, max: usize) -> Result<Vec<u8>, String> {
 #[test]
 fn read_file_head_reads_no_more_than_it_is_asked_for() {
     use std::io::Write as _;
-    /// Removes the file when the test ends, a failed assertion included.
-    struct Remove(std::path::PathBuf);
-    impl Drop for Remove {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let path = std::env::temp_dir().join(format!("vectorcraft-read-head-{}", std::process::id()));
-    // A leftover file or link at the path is removed (never followed), and the new file is created
-    // exclusively.
-    let _ = std::fs::remove_file(&path);
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
-    let guard = Remove(path);
+    let mut f = tempfile::Builder::new().prefix("vectorcraft-read-head-").tempfile().unwrap();
     f.write_all(b"0123456789").unwrap();
-    drop(f);
-    let p = guard.0.to_string_lossy();
+    let p = f.path().to_string_lossy();
     assert_eq!(read_file_head(&p, 4).unwrap(), b"0123");
     assert_eq!(read_file_head(&p, 20).unwrap(), b"0123456789", "a shorter file is read whole");
     assert!(read_file_head(&std::env::temp_dir().to_string_lossy(), 4).is_err(), "a folder is not read");
@@ -252,6 +312,7 @@ fn start_pick(request: PickRequest, parent: &Parent, ui: &egui::Context) -> Opti
     std::thread::Builder::new()
         .name("file-dialog".into())
         .spawn(move || {
+            make_folder(&request);
             // The app gone meanwhile has no use for the answer.
             let _ = tx.send(show_dialog(dialog, &request, &parent));
             ui.request_repaint();
@@ -303,7 +364,7 @@ fn start_pick(request: PickRequest, parent: &Parent, ui: &egui::Context) -> Opti
             let picked = dialog.pick_file();
             Box::pin(async move { picked.await.iter().map(path).collect() })
         }
-        PickRequest::OpenMany => {
+        PickRequest::OpenMany | PickRequest::OpenFiles(_) => {
             let picked = dialog.pick_files();
             Box::pin(async move { picked.await.unwrap_or_default().iter().map(path).collect() })
         }
@@ -311,15 +372,18 @@ fn start_pick(request: PickRequest, parent: &Parent, ui: &egui::Context) -> Opti
         // up its Format menu before the sheet begins (#866); rfd shows the others.
         PickRequest::Save(pick) => match mac_save_format::begin(window, &pick) {
             // The dialog thread blocks here until the sheet answers.
-            Some(picked) => Box::pin(async move { picked.recv().unwrap_or_default() }),
-            None => {
+            Ok(mac_save_format::Begin::Shown(picked)) => Box::pin(async move { picked.recv().unwrap_or_default() }),
+            Ok(mac_save_format::Begin::DeferToRfd) => {
                 // Nothing is added to the sheet once rfd has begun it: an accessory view set then
                 // made recent macOS versions dismiss the sheet at once (#1800).
                 let picked = dialog.save_file();
                 Box::pin(async move { picked.await.iter().map(path).collect() })
             }
+            // AppKit returned nil for the panel. rfd uses the same `+savePanel` and would panic
+            // on that nil; treat the pick as cancelled instead (#5980).
+            Err(()) => Box::pin(async move { Vec::new() }),
         },
-        PickRequest::Folder => {
+        PickRequest::Folder | PickRequest::FolderAt(_) => {
             let picked = dialog.pick_folder();
             Box::pin(async move { picked.await.iter().map(path).collect() })
         }
@@ -340,12 +404,15 @@ pub(crate) fn services(parent: Parent, ui: egui::Context) -> Services {
         .and_then(|w| w.window_handle().ok())
         .is_some_and(|h| matches!(h.as_raw(), RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_)));
     let (clip, clip_probe) = (parent.clone(), parent.clone());
-    let (p1, p2, p3, p4, p5) = (parent.clone(), parent.clone(), parent.clone(), parent.clone(), parent);
-    #[cfg(target_os = "macos")]
+    let (p1, p2, p3, p4, p5, p6, p7) = (parent.clone(), parent.clone(), parent.clone(), parent.clone(), parent.clone(), parent.clone(), parent);
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
     let sampled_ui = ui.clone();
+    #[cfg(target_os = "linux")]
+    let sampled_parent = p1.clone();
     Services {
         pick_open: Some(Box::new(move |pick: &FilePick| pick_now(PickRequest::Open(pick.clone()), &p1).into_iter().next())),
         pick_open_multi: Some(Box::new(move || pick_now(PickRequest::OpenMany, &p2))),
+        pick_open_files: Some(Box::new(move |pick: &FilePick| pick_now(PickRequest::OpenFiles(pick.clone()), &p6))),
         pick_save: Some(Box::new(move |pick: &FilePick| pick_now(PickRequest::Save(pick.clone()), &p3).into_iter().next())),
         // Linux shows dialogs on a thread of their own (#592), macOS as sheets (#867); Windows
         // dialogs run the window's events while they are open.
@@ -365,18 +432,22 @@ pub(crate) fn services(parent: Parent, ui: egui::Context) -> Services {
         // Load Actions… refuses a file over its size limit without reading all of it.
         read_head: Some(Box::new(read_file_head)),
         write: Some(Box::new(write_file)),
-        exists: Some(Box::new(|p: &str| std::path::Path::new(p).exists())),
+        exists: Some(std::sync::Arc::new(|p: &str| std::path::Path::new(p).exists())),
         // Background Save and Export write from a worker thread.
         write_shared: Some(std::sync::Arc::new(write_file)),
+        save_write: Some(std::sync::Arc::new(fileio::write_save_file)),
+        save_stream: Some(std::sync::Arc::new(fileio::write_save_file_with)),
         // Native saves stream into the file as they are encoded.
         stream_shared: Some(std::sync::Arc::new(|p: &str, fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>| {
             fileio::write_file_with(p, fill).map_err(|e| e.to_string())
         })),
         // Every format Copy offers and Paste reads (menu-bar Paste never sees egui's Paste event).
-        system_clipboard: Some(clipboard::system_clipboard(clip)),
+        // Its calls are marked for the hang report (`hang_watch`).
+        system_clipboard: Some(Box::new(vectorcraft_ui_egui::hang_beacon::Marked(clipboard::system_clipboard(clip)))),
         // Linux checks whether Paste has something to take on a background thread: an X11 clipboard
-        // owner that never answers holds a read for up to 4 s. Windows only asks which formats the
-        // clipboard holds and macOS asks the pasteboard server, so they check in line.
+        // owner that never answers holds a text read for up to 4 s for each format it tries, and
+        // quitting waits up to `CLIPBOARD_PROBE_STOP_WAIT` for that thread. Windows only asks which
+        // formats the clipboard holds and macOS asks the pasteboard server, so they check in line.
         // The probe's handle is made on its own thread, from the window (`Send`), not its raw display.
         clipboard_probe: cfg!(target_os = "linux").then(|| Box::new(move || clipboard::system_clipboard(clip_probe)) as ClipboardProbeFactory),
         // Help → Discord / website / GitHub, the Discord button, About and Home links.
@@ -389,9 +460,14 @@ pub(crate) fn services(parent: Parent, ui: egui::Context) -> Services {
         // Edit Original of a raster image with Use System Defaults for Edit Original off (#5236).
         open_in_photocraft: Some(Box::new(open_in_photocraft)),
         pick_folder: Some(Box::new(move || pick_now(PickRequest::Folder, &p4).into_iter().next())),
+        pick_folder_at: Some(Box::new(move |start: &str| pick_now(PickRequest::FolderAt(start.to_string()), &p7).into_iter().next())),
         // Sample Color from Screen: the system's color sampler.
         #[cfg(target_os = "macos")]
         screen_color: Some(mac_screen_color::sampler(sampled_ui)),
+        #[cfg(target_os = "linux")]
+        screen_color: Some(linux_screen_color::sampler(sampled_ui, sampled_parent)),
+        #[cfg(windows)]
+        screen_color: Some(windows_screen_color::sampler(sampled_ui)),
         // File → Print: the system's printers and print queue.
         print: Some(Box::new(printing::SystemPrint)),
         ..Default::default()
@@ -608,22 +684,20 @@ mod open_with_tests {
     use super::{check_app, find_photocraft, photocraft_candidates, registered_path, windows_candidates};
 
     /// A fresh, empty folder under the system's temporary folder.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("vc-open-with-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn scratch(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new().prefix(&format!("vc-open-with-{name}-")).tempdir().unwrap()
     }
 
     /// #5236: only an application counts as PhotoCraft, never a document, a folder or a missing
     /// path.
     #[test]
     fn only_applications_are_started() {
-        let d = scratch("check");
+        let temp = scratch("check");
+        let d = temp.path();
         let doc = d.join("notes.txt");
         std::fs::write(&doc, "hi").unwrap();
         assert!(check_app(&doc).is_err(), "a document");
-        assert!(check_app(&d).is_err(), "a folder");
+        assert!(check_app(d).is_err(), "a folder");
         assert!(check_app(&d.join("Missing.app")).is_err(), "a missing path");
         if cfg!(target_os = "macos") {
             let app = d.join("Editor.app");
@@ -639,19 +713,19 @@ mod open_with_tests {
             std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert!(check_app(&tool).is_ok(), "an executable file");
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// PhotoCraft is looked for only where it installs.
     #[test]
     fn photocraft_is_found_where_it_installs() {
-        let d = scratch("find");
+        let temp = scratch("find");
+        let d = temp.path();
         if cfg!(target_os = "macos") {
-            let candidates = photocraft_candidates(Some(&d), None);
+            let candidates = photocraft_candidates(Some(d), None);
             assert_eq!(candidates.first().map(|p| p.to_string_lossy().into_owned()).as_deref(), Some("/Applications/PhotoCraft.app"));
             assert!(candidates.contains(&d.join("Applications/PhotoCraft.app")), "{candidates:?}");
             std::fs::create_dir_all(d.join("Applications/PhotoCraft.app")).unwrap();
-            assert!(find_photocraft(Some(&d), None).unwrap().ends_with("PhotoCraft.app"));
+            assert!(find_photocraft(Some(d), None).unwrap().ends_with("PhotoCraft.app"));
         } else {
             let bin = d.join("bin");
             std::fs::create_dir_all(&bin).unwrap();
@@ -675,7 +749,6 @@ mod open_with_tests {
                 assert_eq!(find_photocraft(None, Some(&path_var)), Some(exe));
             }
         }
-        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// #5327 review: on Windows PhotoCraft is looked for where its installer puts it: the path it
@@ -740,7 +813,7 @@ mod dialog_tests {
 
     /// The file types a dialog was given, by label.
     #[derive(Default)]
-    struct Filters(Vec<(String, Vec<String>)>);
+    struct Filters(Vec<(String, Vec<String>)>, Option<String>);
 
     impl DialogSettings for Filters {
         fn parent(self, _window: &winit::window::Window) -> Self {
@@ -756,7 +829,8 @@ mod dialog_tests {
         fn folder(self, _folder: &str) -> Self {
             self
         }
-        fn file_name(self, _name: &str) -> Self {
+        fn file_name(mut self, name: &str) -> Self {
+            self.1 = Some(name.to_string());
             self
         }
     }
@@ -812,5 +886,25 @@ mod dialog_tests {
         let placed = dialog_for(Filters::default(), &PickRequest::OpenMany).0;
         let first = fileio::place_filters().next().map(|(_, exts)| open_extensions(exts, CASE_SENSITIVE_FILTERS));
         assert_eq!(placed.first().map(|(_, exts)| exts.clone()), first);
+    }
+
+    /// A format selected after the Windows Save As dialog opens can replace the suffix of the
+    /// suggested name. Single-format saves and open dialogs keep the supplied name verbatim.
+    #[cfg(windows)]
+    #[test]
+    fn save_dialog_with_several_formats_leaves_the_extension_to_windows() {
+        let filters = vec![FilePick::filter("VectorCraft", &["vectorcraft"]), FilePick::filter("PDF-compatible .ai", &["ai"])];
+        let pick = FilePick { name: "Poster.vectorcraft".into(), filters: filters.clone(), ..Default::default() };
+        assert_eq!(dialog_for(Filters::default(), &PickRequest::Save(pick.clone())).1.as_deref(), Some("Poster"));
+        assert_eq!(dialog_for(Filters::default(), &PickRequest::Open(pick)).1.as_deref(), Some("Poster.vectorcraft"));
+
+        let pick = FilePick { name: "Poster.AI".into(), filters: filters.clone(), ..Default::default() };
+        assert_eq!(dialog_for(Filters::default(), &PickRequest::Save(pick)).1.as_deref(), Some("Poster"));
+        let pick = FilePick { name: "Poster.design".into(), filters: filters.clone(), ..Default::default() };
+        assert_eq!(dialog_for(Filters::default(), &PickRequest::Save(pick)).1.as_deref(), Some("Poster.design"));
+        let pick = FilePick { name: "draft.v1.vectorcraft".into(), filters: filters.clone(), ..Default::default() };
+        assert_eq!(dialog_for(Filters::default(), &PickRequest::Save(pick)).1.as_deref(), Some("draft.v1.vectorcraft"));
+        let pick = FilePick { name: "Poster.vectorcraft".into(), filters: vec![filters[0].clone()], ..Default::default() };
+        assert_eq!(dialog_for(Filters::default(), &PickRequest::Save(pick)).1.as_deref(), Some("Poster.vectorcraft"));
     }
 }

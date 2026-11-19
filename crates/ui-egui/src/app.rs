@@ -605,6 +605,8 @@ impl VectorcraftApp {
             if self.ui.control_bar {
                 chrome::control_bar(self, ui);
             }
+            // Torn-off application menus stay up after the bar popup closes.
+            menus::show_torn(self, &ctx);
         }
         if self.ui.status_bar && self.ui.screen_mode < 3 {
             chrome::status_bar(self, ui);

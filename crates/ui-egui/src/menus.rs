@@ -53,15 +53,16 @@ pub(crate) use run::TRIM_VIEW_HIDES;
 mod slots;
 mod state;
 mod submenus;
+mod torn;
 mod tree;
 mod ui_commands;
 
 pub use bar::menu_bar;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use bar::menu_open;
-pub(crate) use bar::{home_key, home_showing};
 #[cfg(test)]
-use bar::{menu_body, pointer_reaches_title};
+use bar::{MenuHost, menu_body, pointer_reaches_title};
+pub(crate) use bar::{home_key, home_showing};
 pub use context::{context_items, context_menu_body, ruler_menu_body, ruler_unit_items};
 #[cfg(test)]
 use entries::flatten;
@@ -74,6 +75,7 @@ pub(crate) use invoke::graph_dialog;
 pub(crate) use invoke::with_held_keys;
 pub use invoke::{click_target, invoke, invoke_from_system_menu};
 pub(crate) use keyboard::handle_input as handle_keyboard_input;
+pub use torn::show as show_torn;
 // Shared numeric fields preserve their caret when a transient menu returns their focus.
 pub(crate) use keyboard::restoring_field_focus;
 pub(crate) use labels::lists_plugin;
